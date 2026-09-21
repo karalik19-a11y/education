@@ -4,7 +4,7 @@ import random
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from . import config, stt
+from . import config, stt, autostart
 from .db import Library
 from .matcher import BookMatcher
 from .quiz import QuizSession
@@ -332,8 +332,30 @@ class HomeFrame(tk.Frame):
         ttk.Button(btns, text="🔄  Новый цикл (новая книга)",
                    command=self._new_cycle).grid(row=1, column=1, padx=8, pady=6)
 
+        self.autostart_var = tk.BooleanVar(value=autostart.is_enabled())
+        chk = tk.Checkbutton(
+            self, text="🚀 Запускать «Книжный страж» автоматически при включении компьютера",
+            variable=self.autostart_var, command=self._toggle_autostart,
+            bg=BG, fg=DARK, font=("Segoe UI", 11), activebackground=BG,
+        )
+        chk.pack(pady=(2, 2))
+        self.lbl_autostart = tk.Label(self, text="", bg=BG, fg="#777", font=("Segoe UI", 9))
+        self.lbl_autostart.pack()
+
         self.lbl_wifi = tk.Label(self, text="", bg=BG, font=("Segoe UI", 11, "bold"))
         self.lbl_wifi.pack(pady=2)
+
+    def _toggle_autostart(self):
+        if self.autostart_var.get():
+            ok, info = autostart.enable()
+            if not ok:
+                self.autostart_var.set(False)
+                messagebox.showerror("Автозапуск", f"Не удалось включить автозапуск:\n{info}")
+                return
+            self.lbl_autostart.config(text=f"Автозапуск: {info}", fg=GREEN)
+        else:
+            autostart.disable()
+            self.lbl_autostart.config(text="Автозапуск выключен", fg="#777")
 
     def _read(self):
         self.app.start_reading()
@@ -375,6 +397,13 @@ class HomeFrame(tk.Frame):
             text="● Wi-Fi сейчас ВКЛЮЧЁН" if st == config.WIFI_UNBLOCKED else "● Wi-Fi сейчас ЗАБЛОКИРОВАН",
             fg=GREEN if st == config.WIFI_UNBLOCKED else RED,
         )
+        try:
+            self.autostart_var.set(autostart.is_enabled())
+            self.lbl_autostart.config(
+                text=("Автозапуск: " + autostart.describe()) if autostart.is_enabled() else "",
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
 
 class ReadFrame(tk.Frame):

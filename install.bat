@@ -41,14 +41,22 @@ if not exist data\library.db (
   echo В комплекте должна быть data\library.db. Если её нет - сообщите разработчику.
 )
 
-echo --- 4/4 Самопроверка...
+echo --- 4/5 Самопроверка...
 .venv\Scripts\python.exe -m bookguard selftest
 
+echo --- 5/5 Автозапуск при включении компьютера...
 echo Создаю ярлык "Книжный страж (админ)" на рабочем столе...
 powershell -Command "$s=(New-Object -COM WScript.Shell).CreateShortcut('%USERPROFILE%\Desktop\Книжный страж (админ).lnk'); $s.TargetPath='%~dp0run.bat'; $s.WorkingDirectory='%~dp0'; $s.Save()"
+.venv\Scripts\python.exe -m bookguard autostart on
+if errorlevel 1 (
+  echo ВНИМАНИЕ: автозапуск включить не удалось. Запустите install.bat
+  echo "правой кнопкой - Запуск от имени администратора" и повторите.
+)
 
 echo.
 echo === Установка завершена! ===
-echo Запускайте "Книжный страж (админ)" с рабочего стола (нужны права администратора).
+echo "Книжный страж" будет сам запускаться при входе в Windows и блокировать Wi-Fi.
+echo Отключить автозапуск: run.bat autostart off
+echo Запуск вручную: ярлык "Книжный страж (админ)" или run.bat
 echo Демо без микрофона: run.bat demo
 pause

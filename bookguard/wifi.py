@@ -59,13 +59,21 @@ class WifiController:
         return ok, out
 
     def _set_linux(self, enable: bool):
+        def try_cmds(cmds):
+            out_all, ok_any = "", False
+            for cmd in cmds:
+                ok, out = _run(cmd)
+                if not ok:
+                    # попытка через sudo без запроса пароля (см. install.sh)
+                    ok2, out2 = _run(["sudo", "-n"] + cmd)
+                    ok, out = (ok2, out2) if ok2 else (ok, out + out2)
+                ok_any = ok_any or ok
+                out_all += out
+            return ok_any, out_all
+
         if enable:
-            ok1, o1 = _run(["rfkill", "unblock", "wifi"])
-            ok2, o2 = _run(["nmcli", "radio", "wifi", "on"])
-        else:
-            ok1, o1 = _run(["nmcli", "radio", "wifi", "off"])
-            ok2, o2 = _run(["rfkill", "block", "wifi"])
-        return ok1 or ok2, o1 + o2
+            return try_cmds([["rfkill", "unblock", "wifi"], ["nmcli", "radio", "wifi", "on"]])
+        return try_cmds([["nmcli", "radio", "wifi", "off"], ["rfkill", "block", "wifi"]])
 
     def _set_macos(self, enable: bool):
         ok, out = _run(["networksetup", "-listallhardwareports"])

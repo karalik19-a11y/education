@@ -62,11 +62,21 @@ if [ ! -f data/library.db ]; then
   fi
 fi
 
-echo "--- 4/4 Самопроверка..."
+echo "--- 4/5 Самопроверка..."
 $PY -m bookguard selftest
+
+echo "--- 5/5 Автозапуск при включении компьютера..."
+# безпарольные права на управление Wi-Fi (чтобы работало при автозапуске)
+if command -v sudo >/dev/null 2>&1 && [ -d /etc/sudoers.d ]; then
+  NMCLI=$(command -v nmcli || echo /usr/bin/nmcli)
+  RFKILL=$(command -v rfkill || echo /usr/sbin/rfkill)
+  echo "$USER ALL=(root) NOPASSWD: $NMCLI, $RFKILL" | sudo tee /etc/sudoers.d/bookguard >/dev/null 2>&1 || true
+  sudo chmod 440 /etc/sudoers.d/bookguard 2>/dev/null || true
+fi
+$PY -m bookguard autostart on
 
 echo
 echo "=== Установка завершена! ==="
-echo "Запуск:            bash run.sh"
-echo "Демо без микрофона: bash run.sh demo"
-echo "(Для блокировки Wi-Fi нужны права администратора: sudo bash run.sh)"
+echo "«Книжный страж» добавлен в автозагрузку и будет сам запускаться при входе в систему."
+echo "(Отключить:  bash run.sh autostart off)"
+echo "Запуск вручную: bash run.sh          Демо без микрофона: bash run.sh demo"

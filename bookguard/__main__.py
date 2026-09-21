@@ -7,6 +7,7 @@
   python -m bookguard simulate   — полный прогон цикла без GUI (проверка логики)
   python -m bookguard selftest   — быстрая самопроверка
   python -m bookguard block|unblock|status — управление Wi-Fi
+  python -m bookguard autostart on|off|status — автозапуск вместе с системой
   python -m bookguard books      — список книг в базе
   python -m bookguard devices    — микрофоны в системе
 """
@@ -57,6 +58,23 @@ def cmd_devices():
     print("Микрофоны:")
     for d in list_input_devices():
         print(" ", d)
+
+
+def cmd_autostart(arg="status"):
+    from . import autostart
+    if arg == "on":
+        ok, info = autostart.enable()
+        if ok:
+            print(f"Автозапуск ВКЛЮЧЁН ({info}).")
+            print("Программа будет сама запускаться при входе в систему и блокировать Wi-Fi.")
+        else:
+            print("Не удалось включить автозапуск:", info)
+            sys.exit(2)
+    elif arg == "off":
+        autostart.disable()
+        print("Автозапуск выключен.")
+    else:
+        print("Автозапуск:", autostart.describe())
 
 
 def cmd_selftest():
@@ -114,6 +132,11 @@ def cmd_selftest():
     w2 = WifiController(simulate=True, log=lambda s: None)
     assert w2.block() and w2.unblock()
     print("  [ok] модуль Wi-Fi (симуляция)")
+
+    from . import autostart
+    assert "Книжный страж" in autostart.render_desktop_entry()
+    assert autostart.describe()
+    print("  [ok] модуль автозапуска")
     lib.close()
     print("ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ ✓")
 
@@ -195,6 +218,8 @@ def main():
         cmd_block(True)
     elif cmd == "status":
         cmd_status()
+    elif cmd == "autostart":
+        cmd_autostart(args[1] if len(args) > 1 else "status")
     elif cmd == "books":
         cmd_books()
     elif cmd == "devices":
