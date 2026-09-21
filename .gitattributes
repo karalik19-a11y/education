@@ -1,0 +1,6 @@
+# .bat-файлы храним «как есть» (CRLF), чтобы git/zip-выгрузки не трогали
+# окончания строк — cmd.exe требует CRLF в батниках.
+*.bat -text
+# shell-скрипты и python — всегда LF (CRLF ломает bash на Windows/Git Bash).
+*.sh text eol=lf
+*.py text eol=lf
