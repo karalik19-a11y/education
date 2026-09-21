@@ -11,3 +11,9 @@ __pycache__/
 # служебное
 *.log
 *.wav
+
+# страж (фоновая защита)
+data/guard.out
+data/bg_wipe.cmd
+data/bg_wipe.sh
+bg.marker
