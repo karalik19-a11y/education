@@ -1,0 +1,13 @@
+# модели и загрузки — ставятся установщиком
+.downloads/
+models/
+*.zip
+
+# среда Python
+.venv/
+__pycache__/
+*.pyc
+
+# служебное
+*.log
+*.wav
