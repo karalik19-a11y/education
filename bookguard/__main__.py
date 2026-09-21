@@ -284,6 +284,24 @@ def cmd_selftest():
     assert w2.block() and w2.unblock()
     print("  [ok] модуль Wi-Fi (симуляция)")
 
+    # асинхронный API (GUI): результат приходит колбэком, поток не блокируется
+    import threading as _th
+    ev = _th.Event()
+    got = {}
+
+    def _wifi_cb(ok, state):
+        got["r"] = (ok, state)
+        ev.set()
+
+    w3 = WifiController(simulate=True, log=lambda s: None)
+    w3.unblock_async(_wifi_cb)
+    assert ev.wait(5), "unblock_async должен вызвать колбэк"
+    assert got["r"][0], "unblock_async(simulate) должен вернуть успех"
+    ev.clear()
+    w3.block_async(_wifi_cb)
+    assert ev.wait(5) and got["r"][0]
+    print("  [ok] асинхронные block_async/unblock_async (GUI не «зависает» при вкл. Wi-Fi)")
+
     from . import autostart
     assert "Книжный страж" in autostart.render_desktop_entry(
         "x", "y", "cmd") or True

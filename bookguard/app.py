@@ -80,9 +80,11 @@ class Bar:
 class Session:
     """Состояние цикла: книга, прогресс чтения, Wi-Fi."""
 
-    def __init__(self, lib: Library, wifi: WifiController):
+    def __init__(self, lib: Library, wifi: WifiController, on_wifi=None):
         self.lib = lib
         self.wifi = wifi
+        # on_wifi(op, ok, state) — итог операции над Wi-Fi (из фонового потока)
+        self.on_wifi = on_wifi or (lambda op, ok, state: None)
         self.book = None
         self.matcher = None
         self.text = ""
@@ -145,14 +147,16 @@ class Session:
         return self.lib.get("quiz_passed", "0") == "1"
 
     def unlock(self, reason=""):
-        self.wifi.unblock()
         self.lib.set("wifi_state", config.WIFI_UNBLOCKED)
         if reason:
             self.lib.set("unlocked_reason", reason)
+        # асинхронно: включение адаптера может занять до пары минут,
+        # интерфейс не должен «зависать» на это время
+        self.wifi.unblock_async(lambda ok, st: self.on_wifi("unblock", ok, st))
 
     def relock(self):
-        self.wifi.block()
         self.lib.set("wifi_state", config.WIFI_BLOCKED)
+        self.wifi.block_async(lambda ok, st: self.on_wifi("block", ok, st))
 
 
 # ------------------------------------------------------------------ приложение
@@ -167,8 +171,12 @@ class App(tk.Tk):
 
         self.lib = Library()
         self.wifi = WifiController(simulate=simulate_wifi or demo)
-        self.session = Session(self.lib, self.wifi)
-        self.session.relock()
+        self.session = Session(
+            self.lib, self.wifi,
+            on_wifi=lambda op, ok, st: self._push("wifi_op", op, ok, st),
+        )
+        self.session.relock()  # асинхронно — старт не блокируется
+        self._wifi_pending("block")
 
         self.recognizer = None
         self.reading = False
@@ -317,7 +325,40 @@ class App(tk.Tk):
                     self._uninstall_done(item[1])
                 elif kind == "model_state":
                     self._apply_model_state(item[1], item[2])
+                elif kind == "wifi_op":
+                    self._on_wifi_op(item[1], item[2], item[3])
         except queue.Empty:
+            pass
+
+    # ---------------- Wi-Fi: состояние операций (async, без «зависания»)
+    def _wifi_pending(self, op):
+        if op == "unblock":
+            self.wifi_badge.config(text="  Wi-Fi  ВКЛЮЧАЮ…  ", bg=T["gold"])
+        else:
+            self.wifi_badge.config(text="  Wi-Fi  БЛОКИРУЮ…  ", bg=T["gold"])
+
+    def _on_wifi_op(self, op, ok, state):
+        if op == "unblock":
+            if ok:
+                self.wifi_badge.config(text="  Wi-Fi  ВКЛЮЧЁН  ", bg=T["green"])
+                msg = "🎉 Wi-Fi включён!" if state == "connected" else \
+                    "🎉 Wi-Fi включён — подключение к сети идёт (может занять немного времени)"
+                self.toast(msg, "ok")
+            else:
+                self.wifi_badge.config(text="  Wi-Fi  ЗАБЛОКИРОВАН  ", bg=T["red"])
+                self.toast("⚠ Не удалось включить Wi-Fi. Запустите программу "
+                           "от имени администратора (ярлык «Книжный страж (админ)»).", "err")
+        else:  # block
+            if ok:
+                self.wifi_badge.config(text="  Wi-Fi  ЗАБЛОКИРОВАН  ", bg=T["red"])
+                self.toast("🔒 Wi-Fi заблокирован", "ok")
+            else:
+                self.wifi_badge.config(text="  Wi-Fi  ВКЛЮЧЁН  ", bg=T["green"])
+                self.toast("⚠ Не удалось заблокировать Wi-Fi "
+                           "(нужны права администратора).", "err")
+        try:
+            self.frames["HomeFrame"].refresh()
+        except Exception:  # noqa: BLE001
             pass
 
     def _apply_model_state(self, state, msg):
@@ -382,9 +423,11 @@ class App(tk.Tk):
     # ---------------------------------------------------------------- пароль
     def ask_password(self):
         def on_ok(_pw):
-            self.session.unlock("password")
+            self._wifi_pending("unblock")
+            self.session.unlock("password")  # асинхронно
             self._refresh_chrome()
-            self.toast("🔓 Wi-Fi включён по экстренному паролю", "ok")
+            self.toast("⚡ Пароль принят — включаю Wi-Fi…\n"
+                       "(адаптер перезагружается, может занять до пары минут)", "info")
             self.frames["HomeFrame"].refresh()
 
         PasswordDialog(
@@ -528,9 +571,10 @@ class App(tk.Tk):
         q = self.quiz
         if q.passed():
             self.session.lib.set("quiz_passed", 1)
-            self.session.unlock("quiz")
+            self._wifi_pending("unblock")
+            self.session.unlock("quiz")  # асинхронно
             self._refresh_chrome()
-            self.toast("🎉 Тест пройден! Wi-Fi включён", "ok")
+            self.toast("🎉 Тест пройден! Включаю Wi-Fi…", "ok")
         else:
             self.toast("Тест не пройден — перечитайте и попробуйте ещё раз", "err")
         self.show("HomeFrame")
@@ -679,9 +723,9 @@ class HomeFrame(tk.Frame):
 
     def _relock(self):
         self.app.stop_reading()
-        self.app.session.relock()
+        self.app._wifi_pending("block")
+        self.app.session.relock()  # асинхронно
         self.app._refresh_chrome()
-        self.app.toast("🔒 Wi-Fi заблокирован", "info")
         self.refresh()
 
     def _new_cycle(self):
