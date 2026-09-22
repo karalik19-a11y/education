@@ -66,6 +66,10 @@ if errorlevel 1 (
   echo WARNING: Could not enable startup. Run install.bat as administrator.
   echo You can retry later with: run.bat autostart on
 )
+.venv\Scripts\python.exe -m bookguard autostart doctor
+if errorlevel 1 (
+  echo WARNING: Startup check failed, see details above.
+)
 
 echo.
 echo === Installation completed! ===

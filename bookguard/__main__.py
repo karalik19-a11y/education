@@ -7,7 +7,7 @@
   python -m bookguard simulate   — полный прогон цикла без GUI (проверка логики)
   python -m bookguard selftest   — быстрая самопроверка
   python -m bookguard block|unblock|status — управление Wi-Fi
-  python -m bookguard autostart on|off|status — автозапуск вместе с системой
+  python -m bookguard autostart on|off|status|doctor — автозапуск вместе с системой
   python -m bookguard books      — список книг в базе
   python -m bookguard devices    — микрофоны в системе
 """
@@ -16,27 +16,37 @@ import sys
 import time
 
 from . import config
+from .logger import setup as _setup_logging, get as _get_log, log_path as _log_path
 
 
-def _wait_display(timeout=20):
+def _wait_display(timeout=60):
     """Linux: дождаться, пока появится графический дисплей (X11/Wayland).
 
     При автозапуске (XDG autostart) программа может стартовать раньше,
     чем X11/Wayland-сервер готов — раньше это было молчаливым падением:
     Wi-Fi уже заблокирован, а окно так и не появилось.
+    Ждём до минуты: на медленных компьютерах вход в систему долгий.
     """
     if platform.system() != "Linux":
         return True
     import tkinter
+    log = _get_log()
     deadline = time.monotonic() + timeout
+    waited = False
     while True:
         try:
             root = tkinter.Tk()
             root.withdraw()
             root.destroy()
+            if waited:
+                log.info("дисплей появился, запускаем окно")
             return True
         except Exception:  # noqa: BLE001 — сервер ещё не готов
+            if not waited:
+                log.info("ждём графический дисплей (до %s с)...", timeout)
+                waited = True
             if time.monotonic() >= deadline:
+                log.warning("дисплей так и не появился за %s с", timeout)
                 return False
             time.sleep(0.5)
 
@@ -52,6 +62,11 @@ def _recover_gui_failure(exc, simulate):
     try:
         print("\n⚠ «Книжный страж» не удалось запустить:")
         print(f"   {exc}")
+        print(f"   Подробности — в журнале: {_log_path()}")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        _get_log().error("запуск GUI не удался: %s", exc)
     except Exception:  # noqa: BLE001
         pass
     if simulate:
@@ -106,14 +121,18 @@ def cmd_gui(demo=False, simulate_wifi=False):
         )
         sys.exit(1)
     from .app import App
+    log = _get_log()
+    log.info("запуск GUI (demo=%s, simulate_wifi=%s)", demo, simulate_wifi)
     try:
         app = App(demo=demo, simulate_wifi=simulate_wifi)
         app.mainloop()
     except Exception as exc:  # noqa: BLE001
         # Приложение упало (возможно, уже заблокировав Wi-Fi) — возвращаем сеть,
         # чтобы пользователь не остался «без интернета и без окна».
+        log.exception("падение GUI")
         _recover_gui_failure(exc, simulate)
         sys.exit(1)
+    log.info("GUI завершён штатно")
 
 
 def cmd_books():
@@ -162,6 +181,17 @@ def cmd_autostart(arg="status"):
     elif arg == "off":
         autostart.disable()
         print("Автозапуск выключен.")
+    elif arg == "doctor":
+        print("Проверка автозапуска:")
+        any_on = False
+        for name, ok, detail in autostart.doctor():
+            if name != "Файл запуска" and ok:
+                any_on = True
+            print(f"  [{'ВКЛ' if ok else 'выкл'}] {name}: {detail}")
+        print("Итог:", autostart.describe())
+        if not any_on:
+            print("Подсказка: включите командой «python -m bookguard autostart on».")
+            sys.exit(2)
     else:
         print("Автозапуск:", autostart.describe())
 
@@ -232,6 +262,10 @@ def cmd_selftest():
     from .textnorm import words_of
 
     lib = Library()
+    # самопроверка не должна менять shipped-базу: запоминаем state целиком
+    # (тесты ниже пишут мусор и создают цикл) и возвращаем как было
+    _state_snapshot = {r[0]: r[1] for r in
+                       lib.db.execute("SELECT key, value FROM state")}
     books = lib.books()
     assert len(books) == 10, f"ожидалось 10 книг, найдено {len(books)}"
     print(f"  [ok] база данных: {len(books)} книг")
@@ -270,19 +304,62 @@ def cmd_selftest():
 
     qs = lib.questions(1)
     quiz = QuizSession(qs, size=5)
+    first = quiz.current()
+    assert first is not None and len(first["options"]) == 4, \
+        "вопрос должен нормализоваться к виду с options[4] (иначе падает экран теста)"
+    assert all(isinstance(o, str) and o for o in first["options"])
     while not quiz.finished():
         quiz.answer(quiz.current()["answer"])
     assert quiz.passed()
-    print("  [ok] тест: все верные ответы дают зачёт")
+    print("  [ok] тест: все верные ответы дают зачёт (вопросы со списком options)")
+
+    # защита от мусора в state.pages_required
+    old_need = lib.get("pages_required", str(config.DEFAULT_PAGES_REQUIRED))
+    lib.set("pages_required", "мусор")
+    assert lib.pages_required() == config.DEFAULT_PAGES_REQUIRED, \
+        "pages_required должен переживать мусор в базе"
+    lib.set("pages_required", old_need)
+    print("  [ok] настройки переживают мусор в базе данных")
+
+    # сессия: страницы, прогресс, границы (без GUI — модуль session без Tkinter)
+    from .session import Session
+    from .wifi import WifiController as _WC
+    sess = Session(lib, _WC(simulate=True, log=lambda s: None))
+    assert sess.book and sess.pages and sess.matcher, "сессия должна назначить книгу"
+    req = sess.required_words()
+    assert req > 0, "required_words не имеет права быть 0 (иначе зачёт без чтения)"
+    assert not sess.reading_done() or sess.matcher.pos >= req
+    assert 1 <= sess.current_page() <= sess.last_page_no()
+    assert 0 <= sess.pages_done() <= sess.last_page_no()
+    # указатель в конце книги — показываем последнюю страницу, а не первую
+    sess.matcher.pos = len(sess.matcher.words)
+    assert sess.current_page() == sess.last_page_no()
+    assert sess.reading_done()
+    print("  [ok] сессия: книга, страницы и границы прогресса")
+
+    # журнал пишется в файл (важно для диагностики автозапуска)
+    from .logger import log_path
+    _get_log().info("selftest: проверка журнала")
+    for h in _get_log().handlers:
+        try:
+            h.flush()
+        except Exception:  # noqa: BLE001
+            pass
+    assert log_path().exists(), f"файл журнала не создан: {log_path()}"
+    print(f"  [ok] журнал пишется в файл ({log_path()})")
 
     w2 = WifiController(simulate=True, log=lambda s: None)
     assert w2.block() and w2.unblock()
     print("  [ok] модуль Wi-Fi (симуляция)")
 
     from . import autostart
-    assert "Книжный страж" in autostart.render_desktop_entry()
+    entry = autostart.render_desktop_entry()
+    assert "Книжный страж" in entry
+    assert "run.sh" in entry and "Path=" in entry, "desktop-файл должен вести на run.sh"
     assert autostart.describe()
-    print("  [ok] модуль автозапуска")
+    items = autostart.doctor()
+    assert items and all(len(i) == 3 for i in items), "doctor должен вернуть проверки"
+    print("  [ok] модуль автозапуска (desktop-файл, describe, doctor)")
 
     bad = _check_tk_attributes()
     assert not bad, (
@@ -290,6 +367,15 @@ def cmd_selftest():
         f"«invalid command name»): {', '.join(bad)}"
     )
     print("  [ok] виджеты не перекрывают служебные атрибуты Tkinter")
+    # вернуть state как было (см. снимок в начале самопроверки)
+    try:
+        with lib._lock:
+            lib.db.execute("DELETE FROM state")
+            lib.db.executemany("INSERT INTO state(key, value) VALUES(?,?)",
+                               list(_state_snapshot.items()))
+            lib.db.commit()
+    except Exception:  # noqa: BLE001
+        pass
     lib.close()
     print("ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ ✓")
 
@@ -355,8 +441,11 @@ def cmd_simulate(auto_quiz=True):
 
 
 def main():
+    _setup_logging()
     args = sys.argv[1:]
     cmd = args[0] if args else "gui"
+    if cmd not in ("gui", "demo"):
+        _get_log().info("команда CLI: %s", " ".join(args) if args else "gui")
     if cmd == "gui":
         cmd_gui(demo="--demo" in args, simulate_wifi="--sim-wifi" in args)
     elif cmd == "demo":
