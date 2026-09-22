@@ -21,29 +21,50 @@ def _run(cmd, timeout=15):
         return False, str(e)
 
 
+def _safe_log(msg):
+    """print(), который не роняет процесс, если консоли нет (например,
+    запуск из ярлыка через pythonw — там sys.stdout равен None)."""
+    try:
+        print(msg)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 class WifiController:
     """block()/unblock() переключают Wi-Fi адаптер.
 
     simulate=True — ничего не менять в системе (для демо/тестов).
     """
 
-    def __init__(self, simulate=False, log=print):
+    def __init__(self, simulate=False, log=None):
         self.simulate = simulate
-        self.log = log
+        self.log = log or _safe_log
         self.last_error = None
 
     # ------------- внутренние команды по платформам
     def _iface_windows(self):
         ok, out = _run(["netsh", "interface", "show", "interface"])
+        # колонки: Admin State | State | Type | Interface Name.
+        # «Type» может состоять из ДВУХ слов («network adapter» / «сетевой
+        # адаптер») — раньше имя считалось от 3-го токена, и получалось,
+        # например, «adapter Wi-Fi», из-за чего netsh не находил адаптер.
+        type_words = {
+            "dedicated", "tunnel", "network adapter",
+            "выделенный", "туннель", "сетевой адаптер",
+        }
         for line in out.splitlines():
             low = line.lower()
             if ("wi-fi" in low or "wireless" in low or "беспроводн" in low
                     or "wi fi" in low) and ("admin" not in low):
                 parts = line.split()
-                if len(parts) >= 4:
-                    return " ".join(parts[3:])
-        for candidate in ("Wi-Fi", "Беспроводная сеть", "Wireless Network Connection"):
-            return candidate
+                if len(parts) < 4:
+                    continue
+                if " ".join(parts[2:4]).lower() in type_words:
+                    name = " ".join(parts[4:])
+                else:
+                    name = " ".join(parts[3:])
+                if name:
+                    return name
         return "Wi-Fi"
 
     def _set_windows(self, enable: bool):

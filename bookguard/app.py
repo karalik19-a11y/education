@@ -6,6 +6,7 @@
 поэтому слова закрашиваются сразу, как только их услышал микрофон.
 """
 import queue
+import threading
 import time
 import tkinter as tk
 from tkinter import messagebox
@@ -217,6 +218,9 @@ class Session:
     def quiz_passed(self):
         return self.lib.get("quiz_passed", "0") == "1"
 
+    # СИНХРОННЫЕ (блокирующие UI-поток) переключения — только для CLI/тестов.
+    # GUI использует App._apply_wifi_async(): окно должно быть открыто ДО
+    # смены Wi-Fi, а netsh/nmcli работают в фоновом потоке.
     def unlock(self, reason=""):
         self.wifi.unblock()
         self.lib.set("wifi_state", config.WIFI_UNBLOCKED)
@@ -240,7 +244,11 @@ class App(tk.Tk):
         self.lib = Library()
         self.wifi = WifiController(simulate=simulate_wifi or demo)
         self.session = Session(self.lib, self.wifi)
-        self.session.relock()
+        # ВАЖНО: Wi-Fi блокируется ТОЛЬКО ПОСЛЕ того, как окно открылось
+        # (см. _startup_lock). Если блокировать его здесь, в конструкторе,
+        # то при любой ошибке старта приложение умрёт, а компьютер останется
+        # БЕЗ интернета и БЕЗ интерфейса, где ввести экстренный пароль.
+        self._lock_scheduled = False
 
         # события из фонового потока распознавания -> главный поток
         self.events = queue.Queue()
@@ -261,8 +269,69 @@ class App(tk.Tk):
             self.frames[F.__name__] = fr
             fr.place(relx=0, rely=0, relwidth=1, relheight=1)
         self.show("HomeFrame")
+        self.after(0, self._startup_lock)  # окно показано — теперь блокируем Wi-Fi
         self.after(90, self._tick)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ------------------------------------------------ Wi-Fi: сначала окно, потом блокировка
+    def _startup_lock(self):
+        """Заблокировать Wi-Fi ПОСЛЕ открытия окна.
+
+        Блокировка выполняется в фоновом потоке (netsh/nmcli/rfkill могут
+        работать секунды), чтобы не подвешивать интерфейс; при неудаче
+        пользователю сообщается, что нужны права администратора.
+        """
+        if self._lock_scheduled:
+            return
+        self._lock_scheduled = True
+        self._apply_wifi_async(False)
+
+    def _apply_wifi_async(self, enable, reason=""):
+        """Включить/выключить Wi-Fi в фоновом потоке.
+
+        Обновление интерфейса — только в главном потоке (через after()).
+        Окно приложения при этом всегда открыто, поэтому пользователь
+        никогда не остаётся «без интернета и без окна».
+        """
+        def work():
+            try:
+                ok = self.wifi.unblock() if enable else self.wifi.block()
+            except Exception as e:  # noqa: BLE001
+                ok, err = False, str(e)
+            else:
+                err = self.wifi.last_error
+            try:
+                self.after(0, lambda: self._wifi_done(enable, ok, err, reason))
+            except Exception:  # noqa: BLE001 — окно уже закрыто
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _wifi_done(self, enable, ok, err, reason=""):
+        try:
+            self.lib.set("wifi_state", config.WIFI_UNBLOCKED if enable else config.WIFI_BLOCKED)
+            if reason and enable:
+                self.lib.set("unlocked_reason", reason)
+            self._refresh_chrome()
+            try:
+                self.frames["HomeFrame"].refresh()
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception:  # noqa: BLE001
+            return
+        if ok or self.wifi.simulate:
+            return
+        verb = "включить" if enable else "заблокировать"
+        try:
+            messagebox.showwarning(
+                f"Не удалось {verb} Wi-Fi",
+                "Недостаточно прав (нужен администратор / sudo).\n\n"
+                "Запустите программу от имени администратора (Windows)\n"
+                "или через sudo (Linux/macOS) — иначе Wi-Fi не будет блокироваться.\n\n"
+                f"{str(err).strip()[:300]}",
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     # ---------------------------------------------------------------- каркас
     def _build_chrome(self):
@@ -367,7 +436,7 @@ class App(tk.Tk):
 
         def try_pass(event=None):
             if var.get().strip() == config.EMERGENCY_PASSWORD:
-                self.session.unlock("password")
+                self._apply_wifi_async(True, "password")
                 self._refresh_chrome()
                 dlg.destroy()
                 messagebox.showinfo(
@@ -525,7 +594,7 @@ class App(tk.Tk):
         q = self.quiz
         if q.passed():
             self.session.lib.set("quiz_passed", 1)
-            self.session.unlock("quiz")
+            self._apply_wifi_async(True, "quiz")
             self._refresh_chrome()
             messagebox.showinfo(
                 "Доступ открыт!",
@@ -609,7 +678,7 @@ class HomeFrame(tk.Frame):
         self.app.show("ReadFrame")  # чтение стартует само при открытии экрана
 
     def _relock(self):
-        self.app.session.relock()
+        self.app._apply_wifi_async(False)
         self.app._refresh_chrome()
         self.refresh()
 

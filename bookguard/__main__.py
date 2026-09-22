@@ -11,20 +11,109 @@
   python -m bookguard books      — список книг в базе
   python -m bookguard devices    — микрофоны в системе
 """
+import platform
 import sys
+import time
 
 from . import config
 
 
+def _wait_display(timeout=20):
+    """Linux: дождаться, пока появится графический дисплей (X11/Wayland).
+
+    При автозапуске (XDG autostart) программа может стартовать раньше,
+    чем X11/Wayland-сервер готов — раньше это было молчаливым падением:
+    Wi-Fi уже заблокирован, а окно так и не появилось.
+    """
+    if platform.system() != "Linux":
+        return True
+    import tkinter
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            root = tkinter.Tk()
+            root.withdraw()
+            root.destroy()
+            return True
+        except Exception:  # noqa: BLE001 — сервер ещё не готов
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.5)
+
+
+def _recover_gui_failure(exc, simulate):
+    """Приложение не смогло открыться.
+
+    Главное правило безопасности: Никогда не оставлять компьютер без
+    интернета и без способа восстановиться. Если интерфейс не открылся
+    (нет Tkinter, нет дисплея, ошибка при старте) — возвращаем Wi-Fi
+    обратно и объясняем причину (в консоли и, если возможно, в окне).
+    """
+    try:
+        print("\n⚠ «Книжный страж» не удалось запустить:")
+        print(f"   {exc}")
+    except Exception:  # noqa: BLE001
+        pass
+    if simulate:
+        print("   (демо/режим симуляции — система не менялась)")
+        return
+    ok = False
+    try:
+        from .wifi import WifiController
+        ok = WifiController().unblock()
+    except Exception:  # noqa: BLE001
+        ok = False
+    if ok:
+        print("\n   Wi-Fi ВКЛЮЧЁН автоматически (приложение не открылось).")
+        print("   Чтобы снова заблокировать Wi-Fi — запустите программу повторно.")
+    else:
+        if platform.system() == "Windows":
+            hint = "   python -m bookguard unblock   (от имени администратора)"
+        else:
+            hint = "   sudo python3 -m bookguard unblock"
+        print("\n   Не удалось включить Wi-Fi автоматически. Включите сеть вручную или выполните:")
+        print(f"   {hint}")
+    # если дисплей всё-таки доступен — показать ошибку в окне
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror(
+            "«Книжный страж» не запустился",
+            f"{exc}\n\n"
+            + ("Wi-Fi включён автоматически." if ok
+               else "Включите Wi-Fi вручную (см. сообщение в консоли)."),
+        )
+        root.destroy()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def cmd_gui(demo=False, simulate_wifi=False):
+    simulate = bool(demo or simulate_wifi)
     try:
         import tkinter  # noqa: F401
     except ImportError:
         print("Не найден Tkinter. Установите python3-tk (Linux) или Python с Tk (Windows).")
+        _recover_gui_failure("не найден модуль Tkinter", simulate)
+        sys.exit(1)
+    if not _wait_display(timeout=20):
+        _recover_gui_failure(
+            "нет графического дисплея (X11/Wayland). Приложение может работать "
+            "только внутри пользовательской сессии.",
+            simulate,
+        )
         sys.exit(1)
     from .app import App
-    app = App(demo=demo, simulate_wifi=simulate_wifi)
-    app.mainloop()
+    try:
+        app = App(demo=demo, simulate_wifi=simulate_wifi)
+        app.mainloop()
+    except Exception as exc:  # noqa: BLE001
+        # Приложение упало (возможно, уже заблокировав Wi-Fi) — возвращаем сеть,
+        # чтобы пользователь не остался «без интернета и без окна».
+        _recover_gui_failure(exc, simulate)
+        sys.exit(1)
 
 
 def cmd_books():
