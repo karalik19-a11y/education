@@ -19,7 +19,17 @@ def venv_python():
     return win if win.exists() else VENV / "bin" / "python"
 
 
-if in_venv() and sys.prefix != str(VENV):
+def _same_path(a, b):
+    # realpath: без него на симлинкованных путях (типа /tmp на macOS)
+    # сравнение sys.prefix никогда не сходилось и run.py бесконечно
+    # пере-запускал сам себя, не доходя ни до каких сообщений.
+    try:
+        return os.path.realpath(a) == os.path.realpath(b)
+    except OSError:
+        return a == b
+
+
+if in_venv() and not _same_path(sys.executable, str(venv_python())):
     os.execv(str(venv_python()), [str(venv_python()), str(ROOT / "run.py")] + sys.argv[1:])
 
 sys.path.insert(0, str(ROOT))
