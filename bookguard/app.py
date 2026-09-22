@@ -5,17 +5,19 @@
 события в очередь, а все обновления экрана делает главный поток в _tick —
 поэтому слова закрашиваются сразу, как только их услышал микрофон.
 """
+import platform
 import queue
 import threading
 import time
 import tkinter as tk
+import traceback
 from tkinter import messagebox
 
 from . import config, stt
 from .db import Library
-from .matcher import BookMatcher
+from .logger import get as _get_log
 from .quiz import QuizSession
-from .textnorm import words_of, spans_of
+from .session import Session
 from .wifi import WifiController
 
 # ---------------------------------------------------------------- палитра
@@ -41,6 +43,57 @@ NOW_BG = "#f2cd6e"    # текущее слово
 FONT = "Segoe UI"
 SERIF = "Georgia"
 
+# Размер текста книги: границы и шаг кнопок «A− / A+»
+TEXT_SIZE_MIN = 11
+TEXT_SIZE_MAX = 26
+TEXT_SIZE_DEFAULT = 14
+
+
+def _enable_dpi_awareness():
+    """Windows: чёткий (не «мыльный») текст на экранах с высоким DPI.
+
+    Без этого Windows растягивает окно как картинку — буквы расплываются.
+    Вызывать ДО создания Tk(), иначе не подействует.
+    """
+    if platform.system() != "Windows":
+        return
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)  # per-monitor v2
+        except Exception:  # noqa: BLE001 — старые Windows
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _resolve_fonts(root):
+    """Подобрать реально установленные шрифты (Segoe UI/Georgia есть не везде).
+
+    На Linux их обычно нет — без подбора Tkinter молча брал шрифт по умолчанию,
+    и текст выглядел иначе (уже/мельче). Теперь явно выбираем лучший из
+    имеющихся, чтобы книга везде читалась одинаково хорошо.
+    """
+    global FONT, SERIF
+    try:
+        import tkinter.font as tkfont
+        available = set(tkfont.families())
+    except Exception:  # noqa: BLE001
+        return
+    for cand in ("Segoe UI", "DejaVu Sans", "Noto Sans", "Liberation Sans",
+                 "Arial", "Helvetica"):
+        if cand in available:
+            FONT = cand
+            break
+    for cand in ("Georgia", "DejaVu Serif", "Noto Serif", "Liberation Serif",
+                 "Times New Roman", "Times"):
+        if cand in available:
+            SERIF = cand
+            break
+
 
 # ---------------------------------------------------------------- виджеты
 class PButton(tk.Button):
@@ -60,7 +113,8 @@ class PButton(tk.Button):
     }
 
     def __init__(self, parent, text, style="ghost", command=None, font_size=11,
-                 bold=False, padx=16, pady=7, anchor="center", **kw):
+                 bold=False, padx=16, pady=7, anchor="center", wraplength=0,
+                 **kw):
         s = self.STYLES[style]
         super().__init__(
             parent, text=text, command=command, relief="flat", bd=0,
@@ -68,7 +122,8 @@ class PButton(tk.Button):
             activeforeground=s["fg"], highlightthickness=1,
             highlightbackground=s["border"], highlightcolor=s["border"],
             font=(FONT, font_size, "bold" if bold else "normal"),
-            padx=padx, pady=pady, anchor=anchor, cursor="hand2", **kw,
+            padx=padx, pady=pady, anchor=anchor, cursor="hand2",
+            wraplength=wraplength, **kw,
         )
         self._hover = s["hover"]
         self._normal = s["bg"]
@@ -151,104 +206,16 @@ class LevelMeter(tk.Canvas):
             self.create_rectangle(x0, 0, x0 + sw, self._height, outline="", fill=c)
 
 
-# ---------------------------------------------------------------- сессия
-class Session:
-    """Состояние цикла: книга, прогресс чтения, Wi-Fi."""
-
-    def __init__(self, lib: Library, wifi: WifiController):
-        self.lib = lib
-        self.wifi = wifi
-        self.book = None
-        self.matcher = None
-        self.text = ""
-        self.word_spans = []
-        self.pages = {}
-
-        try:
-            bid = int(lib.get("current_book_id") or 0)
-        except (TypeError, ValueError):
-            bid = 0  # в state лежал мусор — начинаем новый цикл
-        if bid and lib.book(bid):
-            self.book = lib.book(bid)
-            self.text = self.book["text"]
-            self.word_spans = spans_of(self.text)
-            self.matcher = BookMatcher(words_of(self.text))
-            try:
-                self.matcher.pos = int(lib.get("word_pos", 0) or 0)
-            except (TypeError, ValueError):
-                self.matcher.pos = 0
-            for p in lib.db.execute(
-                "SELECT * FROM pages WHERE book_id=? ORDER BY page_no", (self.book["id"],)
-            ):
-                self.pages[p["page_no"]] = p
-        else:
-            self.new_cycle(first=True)
-
-    def bind_book(self):
-        self.text = self.book["text"]
-        self.word_spans = spans_of(self.text)
-        self.matcher = BookMatcher(words_of(self.text))
-        self.pages = {}
-        for p in self.lib.db.execute(
-            "SELECT * FROM pages WHERE book_id=? ORDER BY page_no", (self.book["id"],)
-        ):
-            self.pages[p["page_no"]] = p
-
-    def new_cycle(self, first=False):
-        prev = int(self.book["id"]) if self.book else None
-        bid = self.lib.random_book_id(exclude=prev)
-        self.book = self.lib.book(bid)
-        self.bind_book()
-        self.matcher.pos = 0
-        self.lib.set("current_book_id", bid)
-        self.lib.set("word_pos", 0)
-        self.lib.set("quiz_passed", 0)
-
-    def save(self):
-        self.lib.set("word_pos", self.matcher.pos)
-
-    def required_words(self):
-        need_pages = min(self.lib.pages_required(), max(self.pages))
-        p = self.pages.get(need_pages)
-        return p["word_end"] if p else 0
-
-    def pages_done(self):
-        if self.matcher.pos <= 0:
-            return 0
-        page_no = self.lib.page_of_word(self.book["id"], max(0, self.matcher.pos - 1))
-        return page_no or 0
-
-    def current_page(self):
-        page_no = self.lib.page_of_word(self.book["id"], self.matcher.pos)
-        return page_no or 1
-
-    def reading_done(self):
-        return self.matcher.pos >= self.required_words()
-
-    def quiz_allowed(self):
-        return self.reading_done()
-
-    def quiz_passed(self):
-        return self.lib.get("quiz_passed", "0") == "1"
-
-    # СИНХРОННЫЕ (блокирующие UI-поток) переключения — только для CLI/тестов.
-    # GUI использует App._apply_wifi_async(): окно должно быть открыто ДО
-    # смены Wi-Fi, а netsh/nmcli работают в фоновом потоке.
-    def unlock(self, reason=""):
-        self.wifi.unblock()
-        self.lib.set("wifi_state", config.WIFI_UNBLOCKED)
-        if reason:
-            self.lib.set("unlocked_reason", reason)
-
-    def relock(self):
-        self.wifi.block()
-        self.lib.set("wifi_state", config.WIFI_BLOCKED)
-
-
 # ---------------------------------------------------------------- приложение
+# (класс Session живёт в bookguard/session.py — без зависимости от Tkinter,
+# чтобы самопроверка могла тестировать логику без графического режима)
 class App(tk.Tk):
     def __init__(self, demo=False, simulate_wifi=False):
+        _enable_dpi_awareness()  # до создания окна, иначе не подействует
         super().__init__()
+        _resolve_fonts(self)
+        # ошибки в обработчиках кнопок/таймеров — в журнал + окно, а не «тихо»
+        self.report_callback_exception = self._report_callback_exception
         self.title("Книжный страж — читай книгу, открывай Wi-Fi")
         self.configure(bg=BG)
         self.geometry("1040x740")
@@ -285,6 +252,22 @@ class App(tk.Tk):
         self.after(0, self._startup_lock)  # окно показано — теперь блокируем Wi-Fi
         self.after(90, self._tick)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _report_callback_exception(self, exc, val, tb):
+        try:
+            _get_log().error("ошибка обработчика GUI:\n%s",
+                             "".join(traceback.format_exception(exc, val, tb)))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            messagebox.showerror(
+                "Ошибка",
+                f"Что-то пошло не так:\n{val}\n\n"
+                "Программа продолжает работать. Подробности — в журнале\n"
+                "data/logs/bookguard.log",
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     # ------------------------------------------------ Wi-Fi: сначала окно, потом блокировка
     def _startup_lock(self):
@@ -406,6 +389,8 @@ class App(tk.Tk):
                     self._handle_stt_error(payload)
                 elif kind == "wifi_done":
                     self._wifi_done(*payload)
+                elif kind == "autostart_done":
+                    self._autostart_done(*payload)
             except Exception:  # noqa: BLE001
                 pass
         try:
@@ -557,13 +542,51 @@ class App(tk.Tk):
         except Exception:  # noqa: BLE001
             pass
 
+    def toggle_autostart(self):
+        """Включить/выключить автозапуск (в фоновом потоке, чтобы не висеть)."""
+        try:
+            self.frames["HomeFrame"].set_auto_status("⏳ Применяю…")
+        except Exception:  # noqa: BLE001
+            pass
+
+        def work():
+            try:
+                from . import autostart
+                if autostart.is_enabled():
+                    autostart.disable()
+                    res = (True, "выключен")
+                else:
+                    ok, info = autostart.enable()
+                    res = (ok, info)
+            except Exception as e:  # noqa: BLE001
+                res = (False, str(e))
+            self.events.put(("autostart_done", res))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _autostart_done(self, ok, info):
+        try:
+            self.frames["HomeFrame"].refresh()
+        except Exception:  # noqa: BLE001
+            pass
+        if not ok:
+            try:
+                messagebox.showwarning(
+                    "Автозапуск",
+                    "Не удалось изменить автозапуск:\n"
+                    f"{str(info).strip()[:300]}\n\n"
+                    "На Windows для задачи Планировщика нужен запуск "
+                    "от имени администратора.",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
     def _handle_words(self, words):
         """Выполняется в главном потоке: матчинг + подсветка + сохранение."""
         if not words:
             return
         res = self.session.matcher.feed(words)
-        import time as _t
-        now = _t.monotonic()
+        now = time.monotonic()
         if now - self._last_save > 2.0:  # не дёргаем диск на каждом слове
             self._last_save = now
             try:
@@ -609,7 +632,21 @@ class App(tk.Tk):
             return
         self.stop_reading()
         qs = self.lib.questions(self.session.book["id"])
+        if not qs:
+            messagebox.showwarning(
+                "Нет вопросов",
+                "В базе данных нет вопросов к этой книге.\n"
+                "Переустановите программу (install.sh / install.bat).",
+            )
+            return
         self.quiz = QuizSession(qs)
+        if not self.quiz.questions:
+            messagebox.showwarning(
+                "Нет вопросов",
+                "Вопросы к этой книге повреждены.\n"
+                "Переустановите программу (install.sh / install.bat).",
+            )
+            return
         self.show("QuizFrame")
 
     def finish_quiz(self):
@@ -692,6 +729,15 @@ class HomeFrame(tk.Frame):
 
         self.lbl_wifi = tk.Label(wrap, text="", bg=BG, font=(FONT, 11, "bold"))
         self.lbl_wifi.pack(pady=(6, 0))
+
+        auto = tk.Frame(wrap, bg=BG)
+        auto.pack(pady=(4, 0))
+        self.btn_auto = PButton(auto, text="🚀  Автозапуск", font_size=10,
+                                command=self.app.toggle_autostart)
+        self.btn_auto.pack(side="left")
+        self.lbl_auto = tk.Label(auto, text="", bg=BG, fg=MUTED, font=(FONT, 10))
+        self.lbl_auto.pack(side="left", padx=(10, 0))
+
         tk.Label(wrap, text="Читайте вслух текст на экране — слова подсвечиваются в реальном времени,\n"
                             "как только микрофон их услышал. Паузы не нужны.",
                  bg=BG, fg=FAINT, font=(FONT, 10), justify="center").pack(pady=(6, 0))
@@ -713,6 +759,26 @@ class HomeFrame(tk.Frame):
 
     def on_show(self):
         self.refresh()
+
+    def set_auto_status(self, text):
+        try:
+            self.lbl_auto.config(text=text)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def refresh_autostart(self):
+        try:
+            from . import autostart
+            on = autostart.is_enabled()
+            self.lbl_auto.config(
+                text=("включён — программа сама стартует при включении компьютера"
+                      if on else "выключен — включите, чтобы не забывать запускать"),
+                fg=ACCENT if on else GOLD,
+            )
+            self.btn_auto.config(
+                text="🚀  Выключить автозапуск" if on else "🚀  Включить автозапуск")
+        except Exception:  # noqa: BLE001
+            self.set_auto_status("")
 
     def refresh(self):
         s = self.app.session
@@ -745,6 +811,7 @@ class HomeFrame(tk.Frame):
             text="● Wi-Fi сейчас ВКЛЮЧЁН" if st == config.WIFI_UNBLOCKED else "● Wi-Fi сейчас ЗАБЛОКИРОВАН",
             fg=ACCENT if st == config.WIFI_UNBLOCKED else RED,
         )
+        self.refresh_autostart()
 
 
 # ---------------------------------------------------------------- чтение
@@ -757,6 +824,10 @@ class ReadFrame(tk.Frame):
         self._blink = False
         self._disp_level = 0.0
         self._mics = []
+        self.text_size = self._load_text_size()
+        # переносы строк подстраиваются под ширину окна (см. _on_resize),
+        # чтобы текст не уезжал за край на узких экранах
+        self.bind("<Configure>", self._on_resize)
 
         # --- верхняя строка: назад · страница · live-индикатор
         head = tk.Frame(self, bg=BG)
@@ -787,10 +858,13 @@ class ReadFrame(tk.Frame):
         paper_wrap = tk.Frame(self, bg="#0a0f1c", highlightthickness=1,
                               highlightbackground=BORDER)
         paper_wrap.pack(fill="both", expand=True, padx=24, pady=8)
-        self.text = tk.Text(paper_wrap, wrap="word", font=(SERIF, 14), bg=PAPER,
-                            fg=PAPER_TEXT, padx=26, pady=18, spacing1=3, spacing3=6,
+        self.text = tk.Text(paper_wrap, wrap="word", font=(SERIF, self.text_size),
+                            bg=PAPER, fg=PAPER_TEXT, padx=26, pady=18,
+                            spacing1=3, spacing3=6,
                             relief="flat", bd=0, highlightthickness=0,
-                            selectbackground="#d8cfae", insertbackground=PAPER_TEXT)
+                            selectbackground="#d8cfae", selectforeground=PAPER_TEXT,
+                            insertbackground=PAPER_TEXT,
+                            inactiveselectbackground="#e4dcc6")
         scroll = tk.Scrollbar(paper_wrap, command=self.text.yview)
         self.text.configure(yscrollcommand=scroll.set)
         scroll.pack(side="right", fill="y")
@@ -801,6 +875,21 @@ class ReadFrame(tk.Frame):
         self.text.bind("<Right>", lambda e: (self.turn(1), "break")[1])
         self.text.bind("<space>", lambda e: (self.toggle_pause(), "break")[1])
         self.text.bind("<Key>", lambda e: "break")  # текст книги менять нельзя
+        # но выделять и копировать — можно (виджет в обычном состоянии)
+        self.text.bind("<<Paste>>", lambda e: "break")
+        self.text.bind("<<Paste-Selection>>", lambda e: "break")
+        self.text.bind("<<Cut>>", lambda e: "break")
+        self.text.bind("<<Clear>>", lambda e: "break")
+        self.text.bind("<Button-2>", lambda e: "break")  # вставка средней кнопкой
+        # масштаб текста с клавиатуры и колесом мыши
+        self.text.bind("<Control-plus>", lambda e: (self.change_text_size(1), "break")[1])
+        self.text.bind("<Control-KP_Add>", lambda e: (self.change_text_size(1), "break")[1])
+        self.text.bind("<Control-equal>", lambda e: (self.change_text_size(1), "break")[1])
+        self.text.bind("<Control-minus>", lambda e: (self.change_text_size(-1), "break")[1])
+        self.text.bind("<Control-KP_Subtract>", lambda e: (self.change_text_size(-1), "break")[1])
+        self.text.bind("<Control-MouseWheel>", self._on_ctrl_wheel)
+        self.text.bind("<Control-Button-4>", lambda e: (self.change_text_size(1), "break")[1])
+        self.text.bind("<Control-Button-5>", lambda e: (self.change_text_size(-1), "break")[1])
 
         # --- живая строка «услышано»
         heard = Card(self)
@@ -820,8 +909,8 @@ class ReadFrame(tk.Frame):
             side="left")
         self.btn_mic = PButton(microw, text="…", font_size=10, command=self._cycle_mic)
         self.btn_mic.pack(side="left", padx=8)
-        tk.Label(microw, text="(нажмите, чтобы выбрать другой)", bg=BG, fg=FAINT,
-                 font=(FONT, 9)).pack(side="left")
+        tk.Label(microw, text="(нажмите, чтобы выбрать другой; размер текста — кнопки A− / A+ ниже или Ctrl + колесо мыши)",
+                 bg=BG, fg=FAINT, font=(FONT, 9)).pack(side="left")
 
         # --- управление
         row = tk.Frame(self, bg=BG)
@@ -833,10 +922,64 @@ class ReadFrame(tk.Frame):
         self.btn_pause.pack(side="left", padx=4)
         PButton(row, text="▶", padx=14, command=lambda: self.turn(1)).pack(
             side="left", padx=4)
+        PButton(row, text="A−", padx=10, command=lambda: self.change_text_size(-1)).pack(
+            side="left", padx=(18, 2))
+        self.lbl_zoom = tk.Label(row, text="", bg=BG, fg=MUTED, font=(FONT, 10), width=3)
+        self.lbl_zoom.pack(side="left")
+        PButton(row, text="A+", padx=10, command=lambda: self.change_text_size(1)).pack(
+            side="left", padx=(2, 4))
         PButton(row, text="📝 К тесту", style="gold",
                 command=self._quiz).pack(side="left", padx=(18, 4))
         PButton(row, text="На главную",
                 command=self._home).pack(side="left", padx=4)
+        self._apply_text_size()
+
+    # --------- размер текста и переносы
+    def _load_text_size(self):
+        try:
+            v = int(self.app.lib.get("text_size", TEXT_SIZE_DEFAULT)
+                    or TEXT_SIZE_DEFAULT)
+        except (TypeError, ValueError):
+            v = TEXT_SIZE_DEFAULT
+        return max(TEXT_SIZE_MIN, min(TEXT_SIZE_MAX, v))
+
+    def _apply_text_size(self):
+        try:
+            self.text.configure(font=(SERIF, self.text_size),
+                                spacing1=max(2, self.text_size // 5),
+                                spacing3=max(4, self.text_size // 3))
+            self.lbl_zoom.config(text=f"{self.text_size}")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def change_text_size(self, delta):
+        new = max(TEXT_SIZE_MIN, min(TEXT_SIZE_MAX, self.text_size + delta))
+        if new == self.text_size:
+            return
+        self.text_size = new
+        try:
+            self.app.lib.set("text_size", new)
+        except Exception:  # noqa: BLE001
+            pass
+        self._apply_text_size()
+
+    def _on_ctrl_wheel(self, event):
+        delta = getattr(event, "delta", 0)
+        num = getattr(event, "num", 0)
+        if delta > 0 or num == 4:
+            self.change_text_size(1)
+        elif delta < 0 or num == 5:
+            self.change_text_size(-1)
+        return "break"
+
+    def _on_resize(self, event):
+        try:
+            w = max(320, int(event.width) - 60)
+            self.lbl_status.configure(wraplength=w)
+            self.lbl_warn.configure(wraplength=w)
+            self.lbl_partial.configure(wraplength=max(320, int(event.width) - 150))
+        except Exception:  # noqa: BLE001
+            pass
 
     # --------- отображение
     def on_show(self):
@@ -853,13 +996,13 @@ class ReadFrame(tk.Frame):
     def load_page(self):
         s = self.app.session
         page = s.pages.get(self.page_no)
-        self.text.config(state="normal")
+        # виджет всегда в обычном состоянии: текст можно выделять мышью
+        # и копировать (Ctrl+C), а правки запрещены привязками клавиш
         self.text.delete("1.0", "end")
         self.text.tag_remove("done", "1.0", "end")
         self.text.tag_remove("now", "1.0", "end")
         if page:
             self.text.insert("1.0", s.text[page["char_start"]:page["char_end"]])
-        self.text.config(state="disabled")
         self._painted_upto = page["word_start"] if page else 0
         if page:
             self._paint_range(page, self._painted_upto, s.matcher.pos)
@@ -1061,7 +1204,7 @@ class QuizFrame(tk.Frame):
         card = Card(wrap)
         card.pack(fill="x", pady=8)
         self.lbl_q = tk.Label(card, text="", bg=CARD, fg=TEXT, font=(SERIF, 15),
-                              wraplength=700, justify="left")
+                              wraplength=660, justify="left")
         self.lbl_q.pack(padx=28, pady=(22, 6), anchor="w")
         self.lbl_about = tk.Label(card, text="", bg=CARD, fg=FAINT, font=(FONT, 9))
         self.lbl_about.pack(anchor="w", padx=28, pady=(0, 16))
@@ -1071,6 +1214,7 @@ class QuizFrame(tk.Frame):
         self.opt_btns = []
         for i in range(4):
             b = PButton(self.opts_box, text="", font_size=12, anchor="w", padx=18, pady=9,
+                        wraplength=620, justify="left",
                         command=lambda i=i: self._answer(i))
             b.pack(fill="x", pady=4)
             self.opt_btns.append(b)

@@ -66,6 +66,13 @@ class Library:
             row = self.db.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
             return row["value"] if row else default
 
+    def get_int(self, key, default: int) -> int:
+        """Целое из state с защитой от мусора (ValueError -> default)."""
+        try:
+            return int(self.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
     def set(self, key, value):
         with self._lock:
             self.db.execute(
@@ -76,7 +83,12 @@ class Library:
             self.db.commit()
 
     def pages_required(self):
-        return int(self.get("pages_required", config.DEFAULT_PAGES_REQUIRED))
+        need = self.get_int("pages_required", config.DEFAULT_PAGES_REQUIRED)
+        return max(1, min(need, 500))
 
     def close(self):
-        self.db.close()
+        with self._lock:
+            try:
+                self.db.close()
+            except Exception:  # noqa: BLE001 — повторное закрытие безопасно
+                pass

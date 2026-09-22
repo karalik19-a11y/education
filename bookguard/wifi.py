@@ -4,13 +4,17 @@
 При отсутствии прав/системных утилит работает в режиме симуляции:
 действия пишутся в журнал, сам Wi-Fi не трогается.
 """
+import logging
 import platform
 import subprocess
 import sys
+import time
 
 IS_WINDOWS = platform.system() == "Windows"
 IS_MACOS = platform.system() == "Darwin"
 IS_LINUX = platform.system() == "Linux"
+
+logger = logging.getLogger("bookguard")
 
 
 def _run(cmd, timeout=15):
@@ -120,17 +124,32 @@ class WifiController:
             self.log(f"[симуляция] Wi-Fi {action.lower()} (без изменений в системе)")
             return True
         self.log(f"Wi-Fi: {action}...")
-        if IS_WINDOWS:
-            ok, out = self._set_windows(enable)
-        elif IS_MACOS:
-            ok, out = self._set_macos(enable)
-        else:
-            ok, out = self._set_linux(enable)
+        ok, out = False, ""
+        for attempt in (1, 2):
+            try:
+                if IS_WINDOWS:
+                    ok, out = self._set_windows(enable)
+                elif IS_MACOS:
+                    ok, out = self._set_macos(enable)
+                else:
+                    ok, out = self._set_linux(enable)
+            except Exception as e:  # noqa: BLE001
+                ok, out = False, str(e)
+            if ok:
+                break
+            # разовый повтор: netsh/nmcli иногда не срабатывают с первого раза
+            # (служба сети ещё просыпается после включения компьютера)
+            if attempt == 1:
+                time.sleep(1.5)
         if not ok:
-            self.last_error = out.strip()[:400]
+            self.last_error = (out or "").strip()[:400]
             self.log("Не удалось изменить Wi-Fi. Нужны права администратора.")
             self.log(f"({self.last_error})")
             self.log("Запустите программу от имени администратора / через sudo.")
+            logger.warning("Wi-Fi %s: неудача (%s)", action, self.last_error)
+        else:
+            self.last_error = None
+            logger.info("Wi-Fi %s: ok", action)
         return ok
 
     def status_hint(self) -> str:

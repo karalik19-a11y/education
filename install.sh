@@ -74,6 +74,7 @@ if command -v sudo >/dev/null 2>&1 && [ -d /etc/sudoers.d ]; then
   sudo chmod 440 /etc/sudoers.d/bookguard 2>/dev/null || true
 fi
 $PY -m bookguard autostart on
+$PY -m bookguard autostart doctor || echo "WARNING: autostart check failed (see above). Retry with: bash run.sh autostart on"
 
 echo
 echo "=== Установка завершена! ==="
