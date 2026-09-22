@@ -166,6 +166,63 @@ def cmd_autostart(arg="status"):
         print("Автозапуск:", autostart.describe())
 
 
+# служебные атрибуты tkinter.Misc/Widget — перекрывать их своими классами нельзя
+_TK_RESERVED_ATTRS = {
+    "_w", "_name", "tk", "children", "master", "_tclCommands", "_widgetName",
+}
+
+
+def _check_tk_attributes():
+    """GUI-классы не должны перекрывать служебные атрибуты Tkinter.
+
+    tk.Misc хранит путь виджета в self._w, его имя — в self._name, а
+    интерпретатор Tcl — в self.tk. Если свой виджет (например Canvas с
+    прогресс-баром) присвоит self._w = width, каждый вызов пойдёт в Tcl как
+    «760 delete all» и приложение умрёт на старте с
+    TclError: invalid command name "760". Проверка ловит это без дисплея.
+    """
+    import ast
+    files = sorted((config.ROOT / "bookguard").glob("*.py"))
+    found = []
+    for f in files:
+        tree = ast.parse(f.read_text(encoding="utf-8"), filename=str(f))
+        bases, widget_classes = {}, set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            names = []
+            for b in node.bases:
+                if isinstance(b, ast.Attribute) and isinstance(b.value, ast.Name):
+                    names.append(f"{b.value.id}.{b.attr}")
+                elif isinstance(b, ast.Name):
+                    names.append(b.id)
+            bases[node.name] = names
+            if any(n.split(".")[-1] in {
+                "Tk", "Toplevel", "Frame", "Canvas", "Label", "Button", "Text",
+                "Entry", "Scrollbar", "Widget", "Misc", "Variable",
+            } for n in names):
+                widget_classes.add(node.name)
+        for _ in range(5):  # наследование внутри файла: класс виджета -> класс виджета
+            grew = False
+            for cls, names in bases.items():
+                if cls not in widget_classes and any(n in widget_classes for n in names):
+                    widget_classes.add(cls)
+                    grew = True
+            if not grew:
+                break
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef) or node.name not in widget_classes:
+                continue
+            for sub in ast.walk(node):
+                if not isinstance(sub, ast.Assign):
+                    continue
+                for tgt in sub.targets:
+                    if (isinstance(tgt, ast.Attribute) and isinstance(tgt.value, ast.Name)
+                            and tgt.value.id == "self" and tgt.attr in _TK_RESERVED_ATTRS):
+                        found.append(f"{f.name}:{sub.lineno} {node.name}.self.{tgt.attr}")
+    return found
+
+
 def cmd_selftest():
     print("Самопроверка «Книжного стража»...")
     from .db import Library
@@ -226,6 +283,13 @@ def cmd_selftest():
     assert "Книжный страж" in autostart.render_desktop_entry()
     assert autostart.describe()
     print("  [ok] модуль автозапуска")
+
+    bad = _check_tk_attributes()
+    assert not bad, (
+        "виджеты перекрывают служебные атрибуты Tkinter (упадёт с "
+        f"«invalid command name»): {', '.join(bad)}"
+    )
+    print("  [ok] виджеты не перекрывают служебные атрибуты Tkinter")
     lib.close()
     print("ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ ✓")
 

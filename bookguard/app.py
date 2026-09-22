@@ -83,14 +83,20 @@ class Card(tk.Frame):
 
 
 class Bar(tk.Canvas):
-    """Скруглённый прогресс-бар."""
+    """Скруглённый прогресс-бар.
+
+    Размеры храним в _width/_height, а НЕ в _w/_h: имя _w занято Tkinter —
+    это путь виджета в Tcl. Если его перезаписать числом, каждый вызов уйдёт
+    как «760 delete all», и Tk ответит TclError: invalid command name "760"
+    (реальный сбой на старте, воспроизведённый в selftest).
+    """
 
     def __init__(self, parent, width=520, height=14, bg=CARD, fill=ACCENT,
                  track="#0e1628"):
         super().__init__(parent, width=width, height=height, bg=bg,
                          highlightthickness=0, bd=0)
-        self._w = width
-        self._h = height
+        self._width = width
+        self._height = height
         self._fill = fill
         self._track = track
         self._value = 0.0
@@ -110,7 +116,7 @@ class Bar(tk.Canvas):
 
     def _draw(self):
         self.delete("all")
-        w, h, r = self._w, self._h, self._h // 2
+        w, h, r = self._width, self._height, self._height // 2
         self._round_rect(0, 0, w, h, r, fill=self._track)
         fw = max(0, int(w * self._value))
         if fw > 0:
@@ -126,22 +132,23 @@ class LevelMeter(tk.Canvas):
     def __init__(self, parent, width=110, height=10, bg=BG2, n=12):
         super().__init__(parent, width=width, height=height, bg=bg,
                          highlightthickness=0, bd=0)
-        self._w = width
-        self._h = height
+        # см. Bar: self._w — это путь виджета в Tcl, его не перезаписывают
+        self._width = width
+        self._height = height
         self._n = n
 
     def set(self, level):
         self.delete("all")
         lit = int(round(max(0.0, min(1.0, level)) * self._n))
         gap = 3
-        sw = (self._w - gap * (self._n - 1)) / self._n
+        sw = (self._width - gap * (self._n - 1)) / self._n
         for i in range(self._n):
             x0 = i * (sw + gap)
             if i < lit:
                 c = ACCENT if i < self._n * 0.65 else (GOLD if i < self._n * 0.85 else RED)
             else:
                 c = "#24314f"
-            self.create_rectangle(x0, 0, x0 + sw, self._h, outline="", fill=c)
+            self.create_rectangle(x0, 0, x0 + sw, self._height, outline="", fill=c)
 
 
 # ---------------------------------------------------------------- сессия
@@ -157,13 +164,19 @@ class Session:
         self.word_spans = []
         self.pages = {}
 
-        bid = lib.get("current_book_id")
-        if bid and lib.book(int(bid)):
-            self.book = lib.book(int(bid))
+        try:
+            bid = int(lib.get("current_book_id") or 0)
+        except (TypeError, ValueError):
+            bid = 0  # в state лежал мусор — начинаем новый цикл
+        if bid and lib.book(bid):
+            self.book = lib.book(bid)
             self.text = self.book["text"]
             self.word_spans = spans_of(self.text)
             self.matcher = BookMatcher(words_of(self.text))
-            self.matcher.pos = int(lib.get("word_pos", 0) or 0)
+            try:
+                self.matcher.pos = int(lib.get("word_pos", 0) or 0)
+            except (TypeError, ValueError):
+                self.matcher.pos = 0
             for p in lib.db.execute(
                 "SELECT * FROM pages WHERE book_id=? ORDER BY page_no", (self.book["id"],)
             ):
@@ -300,18 +313,22 @@ class App(tk.Tk):
                 ok, err = False, str(e)
             else:
                 err = self.wifi.last_error
-            try:
-                self.after(0, lambda: self._wifi_done(enable, ok, err, reason))
-            except Exception:  # noqa: BLE001 — окно уже закрыто
-                pass
+            # ИТОГ — в очередь, а не через self.after(): обращаться к tkinter
+            # (after/createcommand) из чужого потока нельзя, это гонка за
+            # реестр Tcl-команд, и приложение падает с «invalid command name».
+            self.events.put(("wifi_done", (enable, ok, err, reason)))
 
         threading.Thread(target=work, daemon=True).start()
 
     def _wifi_done(self, enable, ok, err, reason=""):
+        # Сохраняем состояние только если Wi-Fi реально переключился: иначе в БД
+        # останется «включён», хотя адаптер всё ещё выключен (и наоборот).
         try:
-            self.lib.set("wifi_state", config.WIFI_UNBLOCKED if enable else config.WIFI_BLOCKED)
-            if reason and enable:
-                self.lib.set("unlocked_reason", reason)
+            if ok or self.wifi.simulate:
+                self.lib.set("wifi_state",
+                             config.WIFI_UNBLOCKED if enable else config.WIFI_BLOCKED)
+                if reason and enable:
+                    self.lib.set("unlocked_reason", reason)
             self._refresh_chrome()
             try:
                 self.frames["HomeFrame"].refresh()
@@ -387,13 +404,18 @@ class App(tk.Tk):
                     self.level = float(payload or 0.0)
                 elif kind == "error":
                     self._handle_stt_error(payload)
+                elif kind == "wifi_done":
+                    self._wifi_done(*payload)
             except Exception:  # noqa: BLE001
                 pass
         try:
             self.frames["ReadFrame"].pulse()
         except Exception:  # noqa: BLE001
             pass
-        self.after(90, self._tick)
+        try:
+            self.after(90, self._tick)
+        except tk.TclError:
+            pass  # окно уже закрыто — цепочку продолжаться не должна
 
     def _on_close(self):
         self.stop_reading()
@@ -844,7 +866,7 @@ class ReadFrame(tk.Frame):
             self._paint_now(page)
             self._scroll_to_now(page)
         need = self.app.lib.pages_required()
-        total = max(s.pages)
+        total = max(s.pages) if s.pages else 1
         self.lbl_page.config(
             text=f"Страница {self.page_no} из {total}"
                  + (f"  ·  цель: {need} стр." if self.page_no <= need else "  ·  сверх программы")
@@ -886,7 +908,7 @@ class ReadFrame(tk.Frame):
 
     def turn(self, delta):
         s = self.app.session
-        total = max(s.pages)
+        total = max(s.pages) if s.pages else 1
         self.page_no = max(1, min(total, self.page_no + delta))
         self.load_page()
 
